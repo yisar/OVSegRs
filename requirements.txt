@@ -1,0 +1,8 @@
+tqdm
+pillow
+opencv-python
+gradio
+ftfy
+regex
+torch
+torchvision

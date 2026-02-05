@@ -1,0 +1,32 @@
+{
+	"1.jpg": {
+		"class_names_str": "cat; plant; ground",
+		"image_max_width": 512,
+		"image_max_height": 1024
+	},
+	"2.jpg": {
+		"class_names_str": "cat; leaves; curb; flashlight",
+		"image_max_width": 512,
+		"image_max_height": 1024
+	},
+	"3.jpg": {
+		"class_names_str": "houses; sky; tree; water in the river; steep river bank; contrail",
+		"image_max_width": 1024,
+		"image_max_height": 512
+	},
+	"4.jpg": {
+		"class_names_str": "cat; river water; stones",
+		"image_max_width": 512,
+		"image_max_height": 512
+	},
+	"5.jpg": {
+		"class_names_str": "green tangerine; ripe tangerine",
+		"image_max_width": 512,
+		"image_max_height": 512
+	},
+	"6.jpg": {
+		"class_names_str": "fruits; palm leaves; house",
+		"image_max_width": 512,
+		"image_max_height": 1024
+	}
+}
