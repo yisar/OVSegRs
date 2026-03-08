@@ -2,13 +2,13 @@ import typing as ty
 import gc
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
+from sclip_viewer.clip_for_segm.pamr import PAMR
 from sclip_viewer import clip_for_segm
 from sclip_viewer.clip_for_segm.imagenet_template import openai_imagenet_template
 
-# --- 辅助函数保持不变 ---
+# --- 辅助函数 ---
 def get_cls_idx(name_sets: ty.List[str]) -> tuple[list[str], list[int]]:
     num_cls = len(name_sets)
     class_names, class_indices = [], []
@@ -51,13 +51,14 @@ class CLIPForSegmentation:
             self,
             class_names: ty.List[str],
             size: tuple[int, int],
-            prob_thd=0.2,       # 参考 SegEarth 调低阈值 (原 0.55)
-            logit_scale=45,     # 参考 SegEarth 调低 Scale (原 90)
+            pamr_steps=2,
+            pamr_stride=(8, 16),
+            prob_thd=0.55,
+            logit_scale=90,
             slide_stride=28,
-            slide_crop=224,
+            slide_crop=0,
             area_thd=None,
-            use_template=False,
-            cls_token_lambda=-0.3 # 新增：用于增强局部特征响应
+            use_template=False
         ):
         
         self.data_preprocessor = CustomSegmDataPreProcessor(
@@ -65,7 +66,7 @@ class CLIPForSegmentation:
             rgb_to_bgr=True, size=size
         )
 
-        # 加载 AnyUp 模型
+        # 1. 加载 AnyUp 模型 (默认关闭 natten 以提高兼容性)
         self.anyup = torch.hub.load('wimmerth/anyup', 'anyup_multi_backbone', use_natten=False).to(device)
         self.anyup.eval()
         
@@ -91,48 +92,41 @@ class CLIPForSegmentation:
         self.area_thd = area_thd
         self.slide_stride = slide_stride
         self.slide_crop = slide_crop
-        self.cls_token_lambda = cls_token_lambda
 
+        self.pamr = PAMR(pamr_steps, dilations=pamr_stride).to(device) if pamr_steps > 0 else None
 
     def forward_feature(self, img, logit_size=None):
         if type(img) == list: img = img[0]
 
-        # 1. 提取全量 CLIP 特征 (包含 CLS token)
+        # 提取 CLIP 特征
         image_features = clip_for_segm_model.encode_image(img, return_all=True, csa=True)
+        image_features /= image_features.norm(dim=-1, keepdim=True)
         
-        # 2. 特征重构 (核心优化点：参考 SegEarth 减去全局偏置)
-        cls_token = image_features[:, 0:1, :]   # (B, 1, C)
-        patch_tokens = image_features[:, 1:, :] # (B, L, C)
-        
-        # 局部特征增强逻辑
-        refined_patch_tokens = patch_tokens + self.cls_token_lambda * cls_token
-        refined_patch_tokens /= refined_patch_tokens.norm(dim=-1, keepdim=True)
-        
-        # 计算低分辨维度
+        patch_features = image_features[:, 1:] 
         patch_size = clip_for_segm_model.visual.patch_size
         w_lr, h_lr = img.shape[-2] // patch_size, img.shape[-1] // patch_size
-        lr_feat = refined_patch_tokens.permute(0, 2, 1).reshape(-1, patch_tokens.shape[-1], w_lr, h_lr)
+        lr_feat = patch_features.permute(0, 2, 1).reshape(-1, patch_features.shape[-1], w_lr, h_lr)
 
-        # 3. 精度对齐并进行 AnyUp 上采样
+        # --- 修复精度冲突：将输入转换为 AnyUp 模型权重相同的类型 (Float) ---
         anyup_dtype = next(self.anyup.parameters()).dtype
         img_input = img.to(anyup_dtype)
         lr_feat = lr_feat.to(anyup_dtype)
+
         target_size = logit_size if logit_size is not None else img.shape[-2:]
         
-        # 上采样：利用原图结构指导特征对齐
+        # 2. 调用 AnyUp 进行上采样 (对超大图，增加 q_chunk_size 防止显存溢出)
         hr_feat = self.anyup(img_input, lr_feat, output_size=target_size, q_chunk_size=128)
         
-        # 4. 计算相似度矩阵
+        # 转回原始精度计算 logits
         hr_feat = hr_feat.to(self.dtype)
         logits = torch.einsum('bchw,qc->bqhw', hr_feat, self.query_features)
 
-        del image_features, lr_feat, hr_feat, refined_patch_tokens
+        del image_features, lr_feat, hr_feat
         gc.collect()
         torch.cuda.empty_cache()
         return logits
 
     def forward_slide(self, img, img_metas, stride=112, crop_size=224):
-        # --- 保持原有逻辑，但内部会调用优化后的 forward_feature ---
         if type(img) == list: img = img[0].unsqueeze(0)
         stride = (stride, stride) if type(stride) == int else stride
         crop_size = (crop_size, crop_size) if type(crop_size) == int else crop_size
@@ -155,29 +149,29 @@ class CLIPForSegmentation:
         img_size = img_metas[0]['ori_shape'][:2]
         logits = nn.functional.interpolate(preds, size=img_size, mode='bilinear')
 
+        if self.pamr:
+            img_hr = nn.functional.interpolate(img, size=img_size, mode='bilinear')
+            logits = self.pamr(img_hr, logits.to(img.dtype)).to(self.dtype)
         return logits
 
     def predict(self, inputs):
         with torch.no_grad():
             batch_img_metas = [dict(ori_shape=inputs.shape[2:])] * inputs.shape[0]
-            if self.slide_crop > 0:
-                seg_logits = self.forward_slide(inputs, batch_img_metas, self.slide_stride, self.slide_crop)
-            else:
-                seg_logits = self.forward_feature(inputs, batch_img_metas[0]['ori_shape'])
+            seg_logits = self.forward_slide(inputs, batch_img_metas, self.slide_stride, self.slide_crop) if self.slide_crop > 0 else self.forward_feature(inputs, batch_img_metas[0]['ori_shape'])
             return self.postprocess_result(seg_logits)
 
     def postprocess_result(self, seg_logits):
         batch_size = seg_logits.shape[0]
         seg_preds = []
         for i in range(batch_size):
-            # 使用较低的 logit_scale 能保留更多 AnyUp 的细节
             cur_logits = (seg_logits[i] * self.logit_scale).softmax(0)
-            
             if self.num_classes != self.num_queries:
                 cls_index = nn.functional.one_hot(self.query_idx, self.num_classes).T.view(self.num_classes, self.num_queries, 1, 1)
                 cur_logits = (cur_logits.unsqueeze(0) * cls_index).max(1)[0]
-            
-            # 阈值判定
+            if self.area_thd is not None:
+                predictions = nn.functional.one_hot(cur_logits.argmax(0), self.num_classes).to(cur_logits.dtype)
+                area_pred = (predictions[:, :, 1:].sum((0, 1), keepdim=True) > self.area_thd * (h*w)).to(cur_logits.dtype)
+                cur_logits[1:] *= area_pred.transpose(0, -1)
             seg_pred = cur_logits.argmax(0, keepdim=True)
             seg_pred[cur_logits.max(0, keepdim=True)[0] < self.prob_thd] = 0
             seg_preds.append(seg_pred)

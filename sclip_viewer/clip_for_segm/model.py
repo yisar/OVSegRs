@@ -1,6 +1,3 @@
-### CLIP source code from OpenAI:
-# https://github.com/openai/CLIP/blob/main/clip/clip.py
-
 from collections import OrderedDict
 from typing import Tuple, Union
 import math
@@ -186,7 +183,6 @@ class ResidualAttentionBlock(nn.Module):
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        # pdb.set_trace()
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
     def forward(self, x: torch.Tensor):
@@ -227,7 +223,11 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
     
     def forward(self, x: torch.Tensor, return_all=False, csa=True):
-
+        """
+        ClearCLIP Optimization is HARDCODED here:
+        - Layers 0 to N-2: Standard S-CLIP (CSA + Residual + MLP)
+        - Layer N-1 (Last): ClearCLIP Mode (CSA ONLY, No Residual, No MLP)
+        """
         B, nc, w, h = x.shape
 
         x = self.conv1(x)  # shape = [*, width, grid, grid]
@@ -244,11 +244,25 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)           
 
         x = x.permute(1, 0, 2)  # NLD -> LND
+        
+        num_blocks = len(self.transformer.resblocks)
+
+        # Process all layers EXCEPT the last one (Standard S-CLIP behavior)
         for blk in self.transformer.resblocks[:-1]:
             x = blk(x)
-        for blk in self.transformer.resblocks[-1:]:
-            x = x + self.custom_attn(blk.attn, blk.ln_1(x), csa=csa)
-            x = x + blk.mlp(blk.ln_2(x))
+        
+        # Process the LAST layer with ClearCLIP logic (CSA only, No Residual, No MLP)
+        # We iterate over the last block explicitly to apply custom logic
+        last_blk = self.transformer.resblocks[-1]
+        
+        # 1. Compute Attention using CSA
+        attn_out = self.custom_attn(last_blk.attn, last_blk.ln_1(x), csa=csa)
+        
+        # 2. Apply ClearCLIP: Skip Residual and Skip MLP
+        # Original: x = x + attn_out; x = x + mlp(...)
+        # Modified: x = attn_out
+        x = attn_out
+
         x = x.permute(1, 0, 2)  # LND -> NLD
             
         if return_all:
@@ -313,14 +327,17 @@ class VisionTransformer(nn.Module):
         return attn_output
     
     def get_attn(self, x, layer='all', csa=False):
-
+        """
+        Extract attention maps. 
+        Logic matches the hard-coded forward pass: Last layer has no residual/mlp added to state.
+        """
         B, nc, w, h = x.shape
 
-        x = self.conv1(x.type(self.conv1.weight.dtype))  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = self.conv1(x.type(self.conv1.weight.dtype))
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
 
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
         
         if x.shape[1] != self.positional_embedding.shape[0]:
             x = x + self.interpolate_pos_encoding(x, w, h).to(x.dtype)
@@ -328,28 +345,30 @@ class VisionTransformer(nn.Module):
             x = x + self.positional_embedding.to(x.dtype)
 
         x = self.ln_pre(x)
-
         x = x.permute(1, 0, 2)  # NLD -> LND
 
+        num_blocks = len(self.transformer.resblocks)
+        attn_map = []
+
+        for i, blk in enumerate(self.transformer.resblocks):
+            is_last_layer = (i == num_blocks - 1)
+            
+            # Compute attention and output
+            attn_out, attn_weights = self.custom_attn(blk.attn, blk.ln_1(x), with_attn=True, csa=True if is_last_layer else False)
+            attn_map.append(attn_weights)
+            
+            # Update state x to match forward pass logic
+            if is_last_layer:
+                # ClearCLIP Mode: Only attention output, no residual, no MLP
+                x = attn_out
+            else:
+                # Standard Mode: Residual + MLP
+                x = x + attn_out
+                x = x + blk.mlp(blk.ln_2(x))
+
         if layer == 'final':
-            for blk in self.transformer.resblocks[:-1]:
-                x = blk(x)
-            attn_map = self.custom_attn(self.transformer.resblocks[-1].attn,
-                                        self.transformer.resblocks[-1].ln_1(x),
-                                        csa=csa, return_attn=True)
-            return attn_map
+            return attn_map[-1]
         elif layer == 'all':
-            attn_map = []
-            for blk in self.transformer.resblocks[:-1]:
-                x_i, attn_i = self.custom_attn(blk.attn, blk.ln_1(x), with_attn=True)
-                x = x + x_i
-                x = x + blk.mlp(blk.ln_2(x))
-                attn_map.append(attn_i)
-            for blk in self.transformer.resblocks[-1:]:
-                x_i, attn_i = self.custom_attn(blk.attn, blk.ln_1(x), with_attn=True, csa=True)
-                x = x + x_i
-                x = x + blk.mlp(blk.ln_2(x))
-                attn_map.append(attn_i)
             return attn_map
         else:
             raise ValueError('layer should be final or all')
@@ -357,18 +376,18 @@ class VisionTransformer(nn.Module):
 
 class CLIP(nn.Module):
     def __init__(self,
-                 embed_dim: int, # 512
+                 embed_dim: int,
                  # vision
-                 image_resolution: int, # 224
-                 vision_layers: Union[Tuple[int, int, int, int], int], # 12
-                 vision_width: int, # 768
-                 vision_patch_size: int, # 16
+                 image_resolution: int,
+                 vision_layers: Union[Tuple[int, int, int, int], int],
+                 vision_width: int,
+                 vision_patch_size: int,
                  # text
-                 context_length: int, # 77
-                 vocab_size: int, # 49408
-                 transformer_width: int, # 512
-                 transformer_heads: int, # 8
-                 transformer_layers: int # 12
+                 context_length: int,
+                 vocab_size: int,
+                 transformer_width: int,
+                 transformer_heads: int,
+                 transformer_layers: int
                  ):
         super().__init__()
         self.context_length = context_length
@@ -440,27 +459,28 @@ class CLIP(nn.Module):
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
     def build_attention_mask(self):
-        # lazily create causal attention mask, with full attention between the vision tokens
-        # pytorch uses additive attention mask; fill with -inf
         mask = torch.empty(self.context_length, self.context_length)
         mask.fill_(float("-inf"))
-        mask.triu_(1)  # zero out the lower diagonal
+        mask.triu_(1)
         return mask
 
     @property
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, return_all=False, csa=False):
+    def encode_image(self, image, return_all=False, csa=True):
+        """
+        ClearCLIP optimization is now default in the visual encoder.
+        No extra arguments needed.
+        """
         return self.visual(image.type(self.dtype), return_all=return_all, csa=csa)
 
     def encode_text(self, text):
-        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
-
+        x = self.token_embedding(text).type(self.dtype)
         x = x + self.positional_embedding.type(self.dtype)
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = x.permute(1, 0, 2)
         x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = x.permute(1, 0, 2)
         x = self.ln_final(x).type(self.dtype)
 
         return x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
@@ -469,16 +489,13 @@ class CLIP(nn.Module):
         image_features = self.encode_image(image)
         text_features = self.encode_text(text)
 
-        # normalized features
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
         logits_per_image = logit_scale * image_features @ text_features.t()
         logits_per_text = logits_per_image.t()
 
-        # shape = [global_batch_size, global_batch_size]
         return logits_per_image, logits_per_text
 
 def convert_weights(model: nn.Module):

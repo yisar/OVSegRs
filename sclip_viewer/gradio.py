@@ -16,8 +16,6 @@ def segment_image(
         image_max_height: int,
         conf_pixel: float,
         logit_scale: int,
-        pamr_num_iter: int,
-        pamr_dilations_str: str,
         slide_stride: float,
         slide_crop: float,
         area_thd: float,
@@ -25,16 +23,12 @@ def segment_image(
     ) -> tuple[Image.Image, Image.Image, Image.Image]:
     class_names = class_names_str.split(';')
     class_names = ['background'] + class_names
-    pamr_dilations = pamr_dilations_str.split(',')
-    pamr_dilations = [int(dil) for dil in pamr_dilations]
     if area_thd == 0:
         area_thd = None
 
     model = CLIPForSegmentation(
         class_names=class_names,
         size=(image_max_width, image_max_height),
-        pamr_steps=pamr_num_iter,
-        pamr_stride=pamr_dilations,
         prob_thd=conf_pixel,
         logit_scale=logit_scale,
         slide_stride=slide_stride, 
@@ -101,7 +95,7 @@ def get_interface():
             with gr.Column():
                 
                 class_names_str = gr.Textbox(
-                    value="cat",
+                    value="tree;cropland;grass;house;car;road",
                     label="Class names (semicolon separated)", 
                     placeholder="cat; purple bird;  ..."
                 )
@@ -109,8 +103,6 @@ def get_interface():
                 image_max_height = gr.Number(label="Height (px)", value=1024, minimum=448)
                 conf_pixel = gr.Slider(0, 1, step=0.01, value=0.5, label="Confidence pixel threshold")
                 logit_scale = gr.Slider(1, 200, step=1, value=95, label="Logit scale")
-                pamr_num_iter = gr.Number(value=2, label="PAMR num_iter", minimum=0)
-                pamr_dilations_str = gr.Textbox(value="8, 16", label="PAMR dilations (comma separated)", placeholder="8, 16")
                 slide_stride = gr.Slider(28, 280, step=28, value=112, label="Slide stride")
                 slide_crop = gr.Slider(112, 672, step=112, value=224, label="Slide crop size")
                 area_thd = gr.Slider(0, 0.2, step=0.05, value=0, label="Area threshold")
@@ -138,7 +130,6 @@ def get_interface():
                 input_image, class_names_str, 
                 image_max_width, image_max_height,
                 conf_pixel, logit_scale, 
-                pamr_num_iter, pamr_dilations_str,
                 slide_stride, slide_crop, area_thd,
                 use_template
             ],
