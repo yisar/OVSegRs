@@ -6,7 +6,11 @@ import torch.nn.functional as F
 from PIL import Image, ImageOps
 from torchvision import transforms
 from sclip_viewer import clip_for_segm
-from sclip_viewer.upsample import UPA 
+from sclip_viewer.upsample import UPA_Optimized 
+
+import os
+# 在导入 torch 之前设置！
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 def get_cls_idx(name_sets):
     num_cls = len(name_sets)
@@ -85,8 +89,8 @@ class CLIPForSegmentation:
             h_lr, w_lr = img_tensor.shape[-2] // ps, img_tensor.shape[-1] // ps
             lr_feat = refined.permute(0, 2, 1).reshape(1, -1, h_lr, w_lr)
 
-        # 调用 UPA (自带 enable_grad)
-        hr_feat = UPA(self.current_hr_guide, lr_feat)
+        # 调用 UPA_Optimized (自带 enable_grad)
+        hr_feat = UPA_Optimized(self.current_hr_guide, lr_feat)
         return torch.einsum('bchw,qc->bqhw', hr_feat.to(self.query_features.dtype), self.query_features)
 
     def forward_slide(self, img_tensor, img_metas):

@@ -6,177 +6,153 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 import time
 
-# --- 核心上采样启动函数 ---
-
-def UPA(HR_img, lr_modality):
-    """
-    各向异性像素级联合双边上采样 (带进度日志版)
-    HR_img: PIL Image (高分辨率指导图)
-    lr_modality: [1, C, Hl, Wl] Tensor (低分辨率特征图)
-    """
-    # 强制开启梯度环境，确保在推理脚本中也能 backward
-    with torch.enable_grad():
-        start_time = time.time()
-        USE_AMP = True
-        AMP_DTYPE = torch.float16
-        
-        # 1. 准备数据并转为 CUDA
-        hr = torch.from_numpy(np.array(HR_img)).permute(2, 0, 1).unsqueeze(0).float().cuda() / 255.0  
-        H, W = hr.shape[-2:]
-        Hl, Wl = lr_modality.shape[-2:]
-        scale = int(H / Hl)
-        
-        # 2. 构造训练目标：用下采样的 HR 图像模拟 LR 输入
-        lr_train_input = F.interpolate(hr, scale_factor=1/scale, mode="bicubic", align_corners=False)
-
-        # 3. 初始化模型与优化器
-        model = LearnablePixelwiseAnisoJBU_NoParent(Hl, Wl, scale=scale).cuda()
-        model.train()
-
-        opt = torch.optim.Adam(model.parameters(), lr=1e-1)
-        max_steps = 5100 
-        gamma = (1e-9 / 1e-1) ** (1.0 / max_steps)
-        scheduler = LambdaLR(opt, lr_lambda=lambda step: gamma ** step)
-        scaler = torch.amp.GradScaler('cuda', enabled=USE_AMP)
-
-        print(f"\n[UPA] 开始即时优化 | 目标尺寸: {H}x{W} | 缩放倍率: {scale}x")
-
-        # 4. 快速迭代优化 (通常 50 步足以让边缘收敛)
-        for step in range(1, 21):
-            opt.zero_grad(set_to_none=True)
-
-            with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=AMP_DTYPE):
-                # 模型根据当前参数预测高分辨率图
-                pred = model(lr_train_input, hr) 
-                loss = F.l1_loss(pred, hr)
-
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-            scheduler.step()
-
-            # 每 10 步打印一次进度
-            if step % 10 == 0 or step == 1:
-                mem_used = torch.cuda.memory_allocated() / 1024**2
-                print(f"  > Step {step:2d}/20 | Loss: {loss.item():.6f} | GPU Mem: {mem_used:.1f}MB")
-
-        # 5. 最终推理：使用学到的参数上采样真正的特征图
-        model.eval()
-        with torch.no_grad(), torch.amp.autocast('cuda', enabled=USE_AMP, dtype=AMP_DTYPE):
-            # 注意：lr_modality 需要转为 float32 保证模型输入兼容
-            hr_feat = model(lr_modality.to(torch.float32), hr)
-        
-        end_time = time.time()
-        print(f"[UPA] 优化完成 | 单片耗时: {end_time - start_time:.2f}s")
-            
-        return hr_feat
-
-# --- 内部组件：各向异性计算逻辑 ---
-
+# --- 核心工具函数 ---
 @torch.no_grad()
 def _build_offsets(R_max, device):
+    """预生成邻域偏移量"""
     offs = torch.arange(-R_max, R_max + 1, device=device)
     dY, dX = torch.meshgrid(offs, offs, indexing='ij')
-    return dY.reshape(-1), dX.reshape(-1)
+    # 强制形状为 [Nn, 1, 1]
+    return dY.reshape(-1, 1, 1), dX.reshape(-1, 1, 1)
 
 def _tanh_bound_pi(raw):
     return math.pi * torch.tanh(raw)
 
-def gather_lr_scalar_general(map_lr, Ui, Vi):
-    Hl, Wl = map_lr.shape[-2:]
-    idx = (Ui * Wl + Vi).reshape(-1)
-    return map_lr.view(-1).index_select(0, idx).view(Ui.shape)
-
-def gs_jbu_aniso_noparent(feat_lr, guide_hr, scale, sx_map, sy_map, th_map, sr_map, 
-                         R_max=4, alpha_dyn=2.0, C_chunk=40, Nn_chunk=10):
-    """
-    针对 4GB 显存优化的核心算子
-    C_chunk=64: 通道分块处理，防止中间张量过大
-    Nn_chunk=16: 空间邻域分块，降低显存峰值
-    """
-    _, C, Hl, Wl = feat_lr.shape
-    _, _, Hh, Wh = guide_hr.shape
+# --- 向量化核心算子 (终极防御版) ---
+def gs_jbu_aniso_vectorized(feat_lr, guide_hr, scale, sx_map, sy_map, th_map, sr_map, 
+                            R_max=4, alpha_dyn=2.0):
+    B, C, Hl, Wl = feat_lr.shape
+    _, Ch, Hh, Wh = guide_hr.shape
     dev = feat_lr.device
     dtype_feat = feat_lr.dtype
 
-    y, x = torch.arange(Hh, device=dev).float(), torch.arange(Wh, device=dev).float()
-    Y, X = torch.meshgrid(y, x, indexing='ij')
-    u, v = (Y + 0.5) / scale - 0.5, (X + 0.5) / scale - 0.5
-    uc, vc = torch.round(u).clamp(0, Hl-1).long(), torch.round(v).clamp(0, Wl-1).long()
+    # 1. 生成精准坐标
+    y_hr = torch.arange(Hh, device=dev).float().view(1, Hh, 1).expand(1, Hh, Wh)
+    x_hr = torch.arange(Wh, device=dev).float().view(1, 1, Wh).expand(1, Hh, Wh)
+    
+    uc = torch.round((y_hr + 0.5) / scale - 0.5).long().clamp(0, Hl-1)
+    vc = torch.round((x_hr + 0.5) / scale - 0.5).long().clamp(0, Wl-1)
 
-    # 预计算半径图
-    sigma_eff_hr = F.interpolate(torch.maximum(sx_map, sy_map), (Hh, Wh), mode='bilinear', align_corners=False)
-    R_map = torch.ceil(alpha_dyn * sigma_eff_hr).clamp_(min=1, max=R_max).long()
+    # 2. 获取邻域偏移与索引
+    dY, dX = _build_offsets(R_max, dev)
+    Nn = dY.shape[0]  # R_max=4 时，Nn=81
+    
+    Ui = (uc + dY).clamp(0, Hl-1) # [Nn, Hh, Wh]
+    Vi = (vc + dX).clamp(0, Wl-1) # [Nn, Hh, Wh]
+    idx_flat = (Ui * Wl + Vi).reshape(-1)
 
-    dY_all, dX_all = _build_offsets(R_max, dev)
-    num_s = torch.zeros(C, Hh, Wh, device=dev)
-    den_s = torch.zeros(Hh, Wh, device=dev)
-    m = torch.full((Hh, Wh), float("-inf"), device=dev)
+    # 3. 极速采样器
+    def fast_sample(src_map, channels):
+        src_flat = src_map.view(channels, -1)
+        sampled = src_flat.index_select(1, idx_flat)
+        return sampled.view(channels, Nn, Hh, Wh)
 
-    guide_lr = F.interpolate(guide_hr, size=(Hl, Wl), mode='bilinear', align_corners=False)
-    feat_flat = feat_lr[0].permute(1, 2, 0).reshape(Hl*Wl, C).contiguous()
+    # 采样参数图并直接剥离多余的通道维，保证输出严格为 [Nn, Hh, Wh]
+    sx = fast_sample(sx_map, 1).squeeze(0).clamp_min(1e-6) 
+    sy = fast_sample(sy_map, 1).squeeze(0).clamp_min(1e-6)
+    th = fast_sample(th_map, 1).squeeze(0)
+    sr = fast_sample(sr_map, 1).squeeze(0).clamp_min(1e-6)
 
-    with torch.amp.autocast('cuda', enabled=True, dtype=torch.float16):
-        for n0 in range(0, dY_all.numel(), Nn_chunk):
-            n1 = min(n0 + Nn_chunk, dY_all.numel())
-            dY, dX = dY_all[n0:n1].view(-1,1,1), dX_all[n0:n1].view(-1,1,1)
-            Bn = dY.shape[0]
+    # 4. 计算空间权重 (各向异性)
+    dx_vec = x_hr.squeeze(0) - ((Vi.float() + 0.5) * scale - 0.5) # [Nn, Hh, Wh]
+    dy_vec = y_hr.squeeze(0) - ((Ui.float() + 0.5) * scale - 0.5) # [Nn, Hh, Wh]
+    
+    cos_t, sin_t = torch.cos(th), torch.sin(th)
+    x_rot = dx_vec * cos_t + dy_vec * sin_t
+    y_rot = -dx_vec * sin_t + dy_vec * cos_t
+    
+    log_w_spatial = -(x_rot**2 / (2 * sx**2 + 1e-8)) - (y_rot**2 / (2 * sy**2 + 1e-8))
 
-            Ui, Vi = torch.clamp(uc + dY, 0, Hl-1), torch.clamp(vc + dX, 0, Wl-1)
-            mask = ((dY**2 + dX**2) <= (R_map**2)).squeeze(0).squeeze(0)
+    # 5. 计算颜色权重 (Range)
+    guide_lr = F.interpolate(guide_hr, (Hl, Wl), mode='bilinear', align_corners=False)
+    g_lr_sampled = fast_sample(guide_lr, Ch) # [Ch, Nn, Hh, Wh]
+    
+    # 严格对齐后求差值并沿通道(Ch)维度求和
+    diff = guide_hr[0].unsqueeze(1) - g_lr_sampled # [Ch, 1, Hh, Wh] - [Ch, Nn, Hh, Wh]
+    g_diff2 = (diff ** 2).sum(dim=0) # -> [Nn, Hh, Wh]
+    log_w_color = -g_diff2 / (2.0 * sr**2 + 1e-8)
 
-            dx, dy = X - ((Vi.float()+0.5)*scale-0.5), Y - ((Ui.float()+0.5)*scale-0.5)
-            sx = gather_lr_scalar_general(sx_map, Ui, Vi).clamp_min(1e-6)
-            sy = gather_lr_scalar_general(sy_map, Ui, Vi).clamp_min(1e-6)
-            th = gather_lr_scalar_general(th_map, Ui, Vi)
-            sr = gather_lr_scalar_general(sr_map, Ui, Vi).clamp_min(1e-6)
+    # 6. 权重归一化与掩码
+    sigma_eff_lr = torch.maximum(sx_map, sy_map)
+    sigma_eff_hr = F.interpolate(sigma_eff_lr, (Hh, Wh), mode='bilinear', align_corners=False)
+    R_map = torch.ceil(alpha_dyn * sigma_eff_hr).clamp(1, R_max).squeeze(0).squeeze(0) # [Hh, Wh]
+    
+    dist_sq = dY**2 + dX**2 # [Nn, 1, 1]
+    mask = dist_sq <= (R_map**2).unsqueeze(0) # [Nn, Hh, Wh]
+    
+    log_w = log_w_spatial + log_w_color
+    log_w = torch.where(mask, log_w, torch.full_like(log_w, float("-inf")))
+    
+    w = F.softmax(log_w, dim=0) # [Nn, Hh, Wh]
 
-            cos_t, sin_t = torch.cos(th), torch.sin(th)
-            log_w = -((dx*cos_t + dy*sin_t)**2)/(2*sx**2 + 1e-8) - ((-dx*sin_t + dy*cos_t)**2)/(2*sy**2 + 1e-8)
-            
-            g_diff2 = sum((guide_hr[0, c] - gather_lr_scalar_general(guide_lr[0, c], Ui, Vi))**2 for c in range(3))
-            log_w += -g_diff2 / (2.0 * sr**2 + 1e-8)
-            log_w = torch.where(mask, log_w, torch.full_like(log_w, float("-inf")))
-
-            m_chunk = torch.max(log_w, dim=0).values
-            valid = torch.isfinite(m_chunk)
-            if not valid.any(): continue
-            
-            m_new = torch.where(valid, torch.maximum(m, m_chunk), m)
-            sc_old = torch.exp(m - m_new)
-            den_s *= sc_old
-            num_s *= sc_old.unsqueeze(0)
-
-            s = torch.exp(log_w - m_new.unsqueeze(0)) 
-            den_s += s.sum(0)
-            
-            idx_flat = (Ui * Wl + Vi).reshape(-1)
-            for c0 in range(0, C, C_chunk):
-                c1 = min(c0 + C_chunk, C)
-                feat_chunk = feat_flat.index_select(0, idx_flat)[:, c0:c1].view(Bn, Hh, Wh, -1)
-                num_s[c0:c1] += (feat_chunk * s.unsqueeze(-1)).sum(0).permute(2, 0, 1)
-            
-            m = m_new
-            del Ui, Vi, log_w, s, dx, dy, mask
-            if n0 % 32 == 0: torch.cuda.empty_cache()
-
-    return (num_s / den_s.clamp_min(1e-8)).unsqueeze(0).to(dtype_feat)
+    # 7. 特征加权 (采用 Einsum 确保维度绝对正确)
+    feat_lr_flat = feat_lr.view(C, -1)
+    feat_sampled = feat_lr_flat.index_select(1, idx_flat).view(C, Nn, Hh, Wh)
+    
+    # 爱因斯坦求和约定：c=通道, n=邻域, h=高度, w=宽度。沿着 n 维度求和
+    feat_hr = torch.einsum('cnhw,nhw->chw', feat_sampled, w)
+    
+    return feat_hr.unsqueeze(0).to(dtype_feat)
 
 # --- 模型定义 ---
 
-class LearnablePixelwiseAnisoJBU_NoParent(nn.Module):
-    def __init__(self, Hl, Wl, scale=16, init_sigma=16.0, init_sigma_r=0.12, R_max=8, alpha_dyn=2.0):
+class LearnablePixelwiseAnisoJBU_Optimized(nn.Module):
+    def __init__(self, Hl, Wl, scale=16, init_sigma=16.0, init_sigma_r=0.12, R_max=4):
         super().__init__()
-        self.scale, self.R_max, self.alpha_dyn = scale, R_max, alpha_dyn
+        self.scale, self.R_max = scale, R_max
         self.sx_raw = nn.Parameter(torch.full((1, 1, Hl, Wl), float(np.log(init_sigma))))
         self.sy_raw = nn.Parameter(torch.full((1, 1, Hl, Wl), float(np.log(init_sigma))))
         self.th_raw = nn.Parameter(torch.zeros((1, 1, Hl, Wl)))
         self.sr_raw = nn.Parameter(torch.full((1, 1, Hl, Wl), float(np.log(init_sigma_r))))
 
     def forward(self, feat_lr, guide_hr):
-        return gs_jbu_aniso_noparent(
+        return gs_jbu_aniso_vectorized(
             feat_lr, guide_hr, self.scale, 
             torch.exp(self.sx_raw), torch.exp(self.sy_raw), 
             _tanh_bound_pi(self.th_raw), torch.exp(self.sr_raw), 
-            R_max=self.R_max, alpha_dyn=self.alpha_dyn
+            R_max=self.R_max
         )
+
+# --- 业务启动入口 ---
+
+def UPA_Optimized(HR_img, lr_modality):
+    with torch.enable_grad():
+        start_time = time.time()
+        
+        # [严密的张量防御机制] 确保 hr 绝对为 [1, 3, H, W]
+        if not torch.is_tensor(HR_img):
+            hr = torch.from_numpy(np.array(HR_img)).float().cuda() / 255.0
+            if hr.ndim == 3: hr = hr.permute(2, 0, 1).unsqueeze(0)
+        else:
+            hr = HR_img.clone().detach().float().cuda()
+            if hr.max() > 2.0: hr = hr / 255.0
+            # 修复上游传入 [H, W, 3] 或 [3, H, W] 的异常情况
+            if hr.ndim == 3:
+                if hr.shape[-1] == 3:  # [H, W, 3] -> [1, 3, H, W]
+                    hr = hr.permute(2, 0, 1).unsqueeze(0)
+                elif hr.shape[0] == 3: # [3, H, W] -> [1, 3, H, W]
+                    hr = hr.unsqueeze(0)
+            elif hr.ndim == 4 and hr.shape[-1] == 3: # [1, H, W, 3] -> [1, 3, H, W]
+                hr = hr.permute(0, 3, 1, 2)
+
+        Hh, Wh = hr.shape[-2:]
+        Hl, Wl = lr_modality.shape[-2:]
+        scale = Hh // Hl
+
+        # 构造自监督训练输入
+        lr_train_input = F.interpolate(hr, size=(Hl, Wl), mode="bicubic", align_corners=False)
+        model = LearnablePixelwiseAnisoJBU_Optimized(Hl, Wl, scale=scale, R_max=4).cuda()
+        opt = torch.optim.Adam(model.parameters(), lr=0.1)
+        
+        for _ in range(10):
+            opt.zero_grad(set_to_none=True)
+            pred = model(lr_train_input, hr)
+            loss = F.l1_loss(pred, hr)
+            loss.backward()
+            opt.step()
+
+        model.eval()
+        with torch.no_grad():
+            hr_feat = model(lr_modality.float(), hr)
+
+        return hr_feat
