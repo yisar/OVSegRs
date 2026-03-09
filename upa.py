@@ -34,10 +34,15 @@ except Exception as e:
     raw_img = Image.new('RGB', (img_size, img_size), color='gray')
 
 # ===================== 4. 图像预处理 =====================
-# 修正：HR 引导图直接用 PIL 图像（调整尺寸即可，UPA 内部会处理张量转换）
-hr_guide = raw_img.resize((img_size, img_size))  # 传给 UPA 的是 PIL Image
+# HR 引导图预处理 (用于 UPA)
+hr_preprocess = transforms.Compose([
+    transforms.Resize((img_size, img_size)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
 
 # CLIP 标准输入
+hr_guide = hr_preprocess(raw_img).unsqueeze(0).to(device)
 clip_img = preprocess(raw_img).unsqueeze(0).to(device)
 
 # ===================== 5. 提取 CLIP 特征 (低分辨率) =====================
@@ -72,7 +77,9 @@ with torch.no_grad():
 # 如果 UPA 依赖于梯度迭代（如某些优化对齐方法），则不要包裹 no_grad
 # 否则建议包裹以节省显存
 with torch.set_grad_enabled(False): 
-    # 修正：第一个参数传 PIL Image (hr_guide)，而非张量
+    # 调用你的 UPA 实现
+    # hr_guide: [1, 3, 448, 448]
+    # lr_feat: [1, 768, 14, 14]
     hr_feat = UPA(hr_guide, lr_feat) 
 
 # ===================== 7. 可视化逻辑 (PCA) =====================
