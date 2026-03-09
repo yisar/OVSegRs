@@ -1,15 +1,15 @@
-from collections import OrderedDict
-from typing import Tuple, Union
 import math
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-import torchvision.transforms.functional as VF
+from collections import OrderedDict
+from typing import Tuple, Union
+
+# --- 基础组件保持不变 ---
 
 class Bottleneck(nn.Module):
     expansion = 4
-
     def __init__(self, inplanes, planes, stride=1):
         super().__init__()
         self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False)
@@ -22,7 +22,6 @@ class Bottleneck(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.downsample = None
         self.stride = stride
-
         if stride > 1 or inplanes != planes * Bottleneck.expansion:
             self.downsample = nn.Sequential(OrderedDict([
                 ("-1", nn.AvgPool2d(stride)),
@@ -151,6 +150,8 @@ class Transformer(nn.Module):
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
 
+# --- 核心修改部分：VisionTransformer ---
+
 class VisionTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
         super().__init__()
@@ -169,11 +170,6 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def forward(self, x: torch.Tensor, return_all=False, nac=True, csa=True):
-        """
-        融合 NAclip + CSA + ClearCLIP 逻辑:
-        - nac=True: 引入空间距离偏置，抑制噪声并平滑语义，但不产生大块模糊。
-        - csa=True: 保持自注意力协作，提高语义分类精度。
-        """
         B, nc, w, h = x.shape
         grid_w, grid_h = w // self.patch_size, h // self.patch_size
 
@@ -187,13 +183,13 @@ class VisionTransformer(nn.Module):
             x = x + self.positional_embedding.to(x.dtype)
 
         x = self.ln_pre(x).permute(1, 0, 2)  # LND
-        num_blocks = len(self.transformer.resblocks)
-
+        
         for blk in self.transformer.resblocks[:-1]:
             x = blk(x)
         
-        # 最后一层使用 NA-Affinity 逻辑
+        # 最后一层应用核心去偏逻辑
         last_blk = self.transformer.resblocks[-1]
+        # 注意：这里调用 custom_attn，内部集成了 SegEarth-OV/ClearCLIP 的减法逻辑
         x = self.custom_attn(last_blk.attn, last_blk.ln_1(x), nac=nac, csa=csa, grid_size=(grid_h, grid_w))
         
         x = x.permute(1, 0, 2)  # NLD
@@ -211,39 +207,54 @@ class VisionTransformer(nn.Module):
         head_dim = embed_dim // num_heads
         scale = head_dim ** -0.5
 
+        # 1. 计算 Q, K, V
         q, k, v = F.linear(x, attn_layer.in_proj_weight, attn_layer.in_proj_bias).chunk(3, dim=-1)
         q = q.contiguous().view(L, bsz * num_heads, head_dim).transpose(0, 1) 
         k = k.contiguous().view(L, bsz * num_heads, head_dim).transpose(0, 1)
         v = v.contiguous().view(L, bsz * num_heads, head_dim).transpose(0, 1)
 
-        # 核心：计算注意力得分
+        # 2. 计算注意力权重
         if csa:
             # CSA 模式: Q-Q + K-K
             attn_logits = (torch.bmm(q, q.transpose(1, 2)) + torch.bmm(k, k.transpose(1, 2))) * scale
         else:
             attn_logits = torch.bmm(q * scale, k.transpose(1, 2))
 
-        # 核心：引入 NAclip 的空间邻域偏置（Spatial Bias）
+        # 3. NAclip 空间邻域偏置
         if nac and grid_size is not None:
             gh, gw = grid_size
             device = x.device
-            # 生成 2D 坐标系
             y, x_coord = torch.meshgrid(torch.arange(gh, device=device), torch.arange(gw, device=device), indexing='ij')
-            coords = torch.stack([y.flatten(), x_coord.flatten()], dim=1).float()  # [HW, 2]
-            # 计算欧氏距离矩阵 [HW, HW]
+            coords = torch.stack([y.flatten(), x_coord.flatten()], dim=1).float()
             dist = torch.cdist(coords, coords, p=2)
-            # 高斯核偏置: 距离越近权重越高。sigma=1.2 是平衡点，不会导致大面积模糊
             sigma = 1.2
             spatial_bias = torch.exp(-dist**2 / (2 * sigma**2))
-            # 应用偏置到 Patch-to-Patch 部分 (Skip CLS token)
-            attn_logits[:, 1:, 1:] += spatial_bias.unsqueeze(0) * 1.5 # 1.5 为增益强度
+            attn_logits[:, 1:, 1:] += spatial_bias.unsqueeze(0) * 1.5
 
         attn_weights = F.softmax(attn_logits, dim=-1)
 
-        if return_attn: return attn_weights
-        attn_output = torch.bmm(attn_weights, v).transpose(0, 1).contiguous().view(L, bsz, embed_dim)
+        # 4. 计算注意力输出
+        # attn_output 形状: [bsz*num_heads, L, head_dim]
+        attn_output = torch.bmm(attn_weights, v)
+
+        # --- SegEarth-OV / ClearCLIP 核心修改: 减去全局 CLS token 贡献 ---
+        # 找到所有 token 对第 0 个 token (CLS) 的注意力权重: [bsz*num_heads, L, 1]
+        # 以及第 0 个 token 的 Value: [bsz*num_heads, 1, head_dim]
+        cls_attn_weights = attn_weights[:, :, 0:1]
+        cls_value = v[:, 0:1, :]
+        
+        # 计算每个 patch 接收到的来自 CLS token 的信息部分
+        cls_contribution = torch.bmm(cls_attn_weights, cls_value)
+        
+        # 从输出中减去该贡献，以消除全局偏差
+        attn_output = attn_output - cls_contribution
+        # -----------------------------------------------------------
+
+        # 5. 重组维度并投影
+        attn_output = attn_output.transpose(0, 1).contiguous().view(L, bsz, embed_dim)
         attn_output = attn_layer.out_proj(attn_output)
 
+        if return_attn: return attn_weights
         return (attn_output, attn_weights) if with_attn else attn_output
 
     def interpolate_pos_encoding(self, x, w, h):
@@ -259,6 +270,8 @@ class VisionTransformer(nn.Module):
         )
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
+
+# --- 后续 CLIP 与构建代码保持不变 ---
 
 class CLIP(nn.Module):
     def __init__(self, embed_dim, image_resolution, vision_layers, vision_width, vision_patch_size,

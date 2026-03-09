@@ -47,8 +47,8 @@ class CLIPForSegmentation:
             size: tuple[int, int], 
             prob_thd=0.2, 
             logit_scale=45, 
-            slide_stride=250, 
-            slide_crop=500, 
+            slide_stride=0, 
+            slide_crop=0, 
             area_thd=None,      # 修正：加上这个参数，解决 TypeError
             use_template=False, # 修正：同步 gradio 中的参数
             cls_token_lambda=-0.3

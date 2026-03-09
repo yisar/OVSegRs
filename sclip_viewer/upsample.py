@@ -69,7 +69,7 @@ def UPA(HR_img, lr_modality):
 def _tanh_bound_pi(raw):
     return math.pi * torch.tanh(raw)
 
-def gs_jbu_grid_differentiable(feat_lr, guide_hr, sx, sy, th, sr, num_bins=12):
+def gs_jbu_grid_differentiable(feat_lr, guide_hr, sx, sy, th, sr, num_bins=24):
     """
     完全张量化且可微分的实现
     """

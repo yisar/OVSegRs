@@ -22,7 +22,7 @@ def segment_image(
         use_template: bool
     ) -> tuple[Image.Image, Image.Image, Image.Image]:
     class_names = class_names_str.split(';')
-    # class_names = ['background'] + class_names
+    class_names = ['background'] + class_names
     if area_thd == 0:
         area_thd = None
 
